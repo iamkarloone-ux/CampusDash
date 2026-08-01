@@ -50,6 +50,9 @@ app.post('/webhook', (req, res) => {
                 let event = entry.messaging[0];
                 let sender_psid = event.sender.id;
 
+                // LOG SENDER PSID FOR EASY ADMIN SETUP
+                console.log(`Incoming message from PSID: ${sender_psid}`);
+
                 if (event.message) {
                     handleIncomingMessage(sender_psid, event.message);
                 } else if (event.postback) {
@@ -109,7 +112,7 @@ async function handleIncomingMessage(sender_psid, message) {
         return;
     }
 
-    // E. CLIENT CONVERSATIONAL FORM STEPS (SAFE CRASH-PROOF STEP CHECK)
+    // E. CLIENT CONVERSATIONAL FORM STEPS
     let currentStep = (session && session.current_step) ? session.current_step : 'IDLE';
 
     switch (currentStep) {
@@ -456,7 +459,7 @@ async function handleAdminMessageStep(psid, session, text) {
 }
 
 // -------------------------------------------------------------
-// 10. BULLETPROOF SESSION HELPERS (PREVENTS NULL CRASH)
+// 10. BULLETPROOF DATABASE & SESSION HELPERS
 // -------------------------------------------------------------
 async function getOrCreateSession(psid) {
     try {
@@ -465,17 +468,36 @@ async function getOrCreateSession(psid) {
 
         let { data: newSession } = await supabase
             .from('user_sessions')
-            .insert([{ psid: psid, current_step: 'IDLE', role: 'CLIENT' }])
+            .upsert({ psid: psid, current_step: 'IDLE', role: 'CLIENT' }, { onConflict: 'psid' })
             .select()
             .single();
 
         if (newSession) return newSession;
     } catch (err) {
-        console.error("Session fetch/create fallback:", err);
+        console.error("Session Upsert Error:", err);
     }
 
-    // FALLBACK OBJECT TO PREVENT NULL CRASH
     return { psid: psid, current_step: 'IDLE', role: 'CLIENT' };
+}
+
+async function updateSession(psid, updates) {
+    try {
+        await supabase.from('user_sessions').upsert({
+            psid: psid,
+            ...updates,
+            updated_at: new Date()
+        }, { onConflict: 'psid' });
+    } catch (err) {
+        console.error("Session update error:", err);
+    }
+}
+
+async function resetSession(psid) {
+    await updateSession(psid, {
+        current_step: 'IDLE', active_order_id: null, errand_tier: null,
+        store_location: null, dropoff_location: null, item_description: null,
+        estimated_item_cost: 0.00, payment_method: null
+    });
 }
 
 async function getPricingSettings() {
@@ -488,15 +510,6 @@ async function getPricingSettings() {
 async function checkIfRunner(psid) {
     const { data } = await supabase.from('runners').select('id').eq('fb_user_id', psid).single();
     return !!data;
-}
-
-async function updateSession(psid, updates) { await supabase.from('user_sessions').update(updates).eq('psid', psid); }
-async function resetSession(psid) {
-    await supabase.from('user_sessions').upsert()
-        current_step: 'IDLE', active_order_id: null, errand_tier: null,
-        store_location: null, dropoff_location: null, item_description: null,
-        estimated_item_cost: 0.00, payment_method: null
-    }).eq('psid', psid);
 }
 
 function sendWelcomeMenu(psid) {
