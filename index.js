@@ -7,7 +7,7 @@ const fetch = require('node-fetch');
 const app = express();
 app.use(bodyParser.json());
 
-// CONFIGURATION
+// CONFIGURATION FROM ENVIRONMENT VARIABLES
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'campusdash_secret_verify_token';
 const ADMIN_PSID = process.env.ADMIN_PSID; // CEO Messenger PSID
@@ -17,7 +17,14 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // -------------------------------------------------------------
-// 1. WEBHOOK VERIFICATION
+// 0. HOMEPAGE ROUTE (Confirms server is live in browser)
+// -------------------------------------------------------------
+app.get('/', (req, res) => {
+    res.send("🚀 CampusDash PH Server is Live and Running!");
+});
+
+// -------------------------------------------------------------
+// 1. WEBHOOK VERIFICATION (GET /webhook)
 // -------------------------------------------------------------
 app.get('/webhook', (req, res) => {
     let mode = req.query['hub.mode'];
@@ -32,7 +39,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 2. MAIN WEBHOOK LISTENER
+// 2. MAIN WEBHOOK LISTENER (POST /webhook)
 // -------------------------------------------------------------
 app.post('/webhook', (req, res) => {
     let body = req.body;
@@ -66,13 +73,13 @@ async function handleIncomingMessage(sender_psid, message) {
 
     let text = message.text ? message.text.trim() : "";
 
-    // 1. ADMIN TRIGGER
+    // A. ADMIN COMMANDS (CEO)
     if (isAdmin && (text.toLowerCase() === 'admin' || session.current_step.startsWith('ADMIN_'))) {
         await handleAdminMessageStep(sender_psid, session, text);
         return;
     }
 
-    // 2. IMAGE / SCREENSHOT ATTACHMENTS
+    // B. IMAGE / SCREENSHOT ATTACHMENTS
     if (message.attachments && message.attachments[0].type === 'image') {
         let imageUrl = message.attachments[0].payload.url;
 
@@ -92,18 +99,20 @@ async function handleIncomingMessage(sender_psid, message) {
         }
     }
 
-    // 3. ACTIVE ORDER 2-WAY MESSAGE RELAY (CLIENT <-> RUNNER)
+    // C. ACTIVE ORDER 2-WAY MESSAGE RELAY (CLIENT <-> RUNNER)
     let isRelayed = await handleActiveOrderRelay(sender_psid, text, isRunner);
     if (isRelayed) return;
 
-    // 4. QUICK REPLIES
+    // D. QUICK REPLIES
     if (message.quick_reply) {
         await handlePayload(sender_psid, session, message.quick_reply.payload);
         return;
     }
 
-    // 5. CLIENT FORM STEPS
-    switch (session.current_step) {
+    // E. CLIENT CONVERSATIONAL FORM STEPS (SAFE CRASH-PROOF STEP CHECK)
+    let currentStep = (session && session.current_step) ? session.current_step : 'IDLE';
+
+    switch (currentStep) {
         case 'STEP_STORE_LOCATION':
             await updateSession(sender_psid, { store_location: text, current_step: 'STEP_DROPOFF_LOCATION' });
             sendTextMessage(sender_psid, "📍 Where should the runner deliver your item? (Building / Room #)");
@@ -242,13 +251,13 @@ async function finalizeOrderAndAutoDispatch(sender_psid) {
         status: requiresDeposit ? 'PENDING_DEPOSIT' : 'DISPATCHED'
     }]).select();
 
-    if (!error) {
+    if (!error && data && data.length > 0) {
         let order = data[0];
         await resetSession(sender_psid);
 
         if (requiresDeposit) {
             sendTextMessage(sender_psid, `🎉 ORDER #CMD-${order.order_number} CREATED!\n\n⚠️ Item >₱200: Send ₱${depositAmt.toFixed(2)} deposit to CEO GCash: 09XX-XXX-XXXX and upload screenshot here!`);
-            sendTextMessage(ADMIN_PSID, `🚨 NEW ORDER #CMD-${order.order_number} REQUIRES ₱${depositAmt.toFixed(2)} DEPOSIT!`);
+            if (ADMIN_PSID) sendTextMessage(ADMIN_PSID, `🚨 NEW ORDER #CMD-${order.order_number} REQUIRES ₱${depositAmt.toFixed(2)} DEPOSIT!`);
         } else {
             sendTextMessage(sender_psid, `🎉 ORDER #CMD-${order.order_number} DISPATCHED!\nNearby runners are being notified!`);
             await broadcastOrderToRunners(order);
@@ -271,14 +280,16 @@ async function handleClientGCashScreenshot(sender_psid, imageUrl) {
 
     await supabase.from('orders').update({ gcash_proof_url: imageUrl }).eq('id', order.id);
 
-    // 1. Forward Screenshot to ADMIN (CEO)
-    sendTextMessage(ADMIN_PSID, `💳 GCASH RECEIPT ATTACHED (#CMD-${order.order_number})\n• Client: ${order.client_name}\n• Deposit Required: ₱${order.deposit_amount}`);
-    sendImageMessage(ADMIN_PSID, imageUrl);
-    sendQuickReplies(ADMIN_PSID, `Approve Order #${order.order_number}?`, [
-        { title: `Approve Deposit #${order.order_number}`, payload: `ADMIN_APPROVE_${order.id}` }
-    ]);
+    // Forward Screenshot to ADMIN (CEO)
+    if (ADMIN_PSID) {
+        sendTextMessage(ADMIN_PSID, `💳 GCASH RECEIPT ATTACHED (#CMD-${order.order_number})\n• Client: ${order.client_name}\n• Deposit Required: ₱${order.deposit_amount}`);
+        sendImageMessage(ADMIN_PSID, imageUrl);
+        sendQuickReplies(ADMIN_PSID, `Approve Order #${order.order_number}?`, [
+            { title: `Approve Deposit #${order.order_number}`, payload: `ADMIN_APPROVE_${order.id}` }
+        ]);
+    }
 
-    // 2. Forward Screenshot to ASSIGNED RUNNER
+    // Forward Screenshot to ASSIGNED RUNNER
     if (order.runners && order.runners.fb_user_id) {
         sendTextMessage(order.runners.fb_user_id, `💳 CLIENT SENT GCASH RECEIPT (#CMD-${order.order_number})!`);
         sendImageMessage(order.runners.fb_user_id, imageUrl);
@@ -445,8 +456,28 @@ async function handleAdminMessageStep(psid, session, text) {
 }
 
 // -------------------------------------------------------------
-// 10. HELPERS & GRAPH API UTILITIES
+// 10. BULLETPROOF SESSION HELPERS (PREVENTS NULL CRASH)
 // -------------------------------------------------------------
+async function getOrCreateSession(psid) {
+    try {
+        let { data } = await supabase.from('user_sessions').select('*').eq('psid', psid).single();
+        if (data) return data;
+
+        let { data: newSession } = await supabase
+            .from('user_sessions')
+            .insert([{ psid: psid, current_step: 'IDLE', role: 'CLIENT' }])
+            .select()
+            .single();
+
+        if (newSession) return newSession;
+    } catch (err) {
+        console.error("Session fetch/create fallback:", err);
+    }
+
+    // FALLBACK OBJECT TO PREVENT NULL CRASH
+    return { psid: psid, current_step: 'IDLE', role: 'CLIENT' };
+}
+
 async function getPricingSettings() {
     const { data } = await supabase.from('system_settings').select('*');
     let s = { fee_small: 30, fee_medium: 50, fee_large: 90, ceo_cut_small: 10, ceo_cut_medium: 15, ceo_cut_large: 25 };
@@ -457,15 +488,6 @@ async function getPricingSettings() {
 async function checkIfRunner(psid) {
     const { data } = await supabase.from('runners').select('id').eq('fb_user_id', psid).single();
     return !!data;
-}
-
-async function getOrCreateSession(psid) {
-    let { data } = await supabase.from('user_sessions').select('*').eq('psid', psid).single();
-    if (!data) {
-        let { data: newSession } = await supabase.from('user_sessions').insert([{ psid: psid }]).select().single();
-        return newSession;
-    }
-    return data;
 }
 
 async function updateSession(psid, updates) { await supabase.from('user_sessions').update(updates).eq('psid', psid); }
@@ -500,4 +522,4 @@ function callSendAPI(psid, messageObj) {
 }
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`CampusDash Final Master Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`CampusDash Master Server running on port ${PORT}`));
