@@ -492,7 +492,7 @@ async function checkIfRunner(psid) {
 
 async function updateSession(psid, updates) { await supabase.from('user_sessions').update(updates).eq('psid', psid); }
 async function resetSession(psid) {
-    await supabase.from('user_sessions').update({
+    await supabase.from('user_sessions').upsert()
         current_step: 'IDLE', active_order_id: null, errand_tier: null,
         store_location: null, dropoff_location: null, item_description: null,
         estimated_item_cost: 0.00, payment_method: null
